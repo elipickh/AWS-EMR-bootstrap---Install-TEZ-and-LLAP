@@ -1,0 +1,161 @@
+#!/bin/bash
+
+# EMR 5.x
+
+# Code to install LLAP is adapted from Jigar Mistry's blog:
+# https://aws.amazon.com/blogs/big-data/turbocharge-your-apache-hive-queries-on-amazon-emr-using-llap/
+
+TEZ_VERSION=`lynx -listonly -dump http://www.apache.org/dist/tez/ | sed -n -e 's/^.*tez\///p' | grep \/ | sort -nrk1 | cut -d/ -f1 | head -1`
+echo "$TEZ_VERSION"
+
+CURRENT_TEZ=`sudo find /usr/lib/tez/ -type f -name '*tez-dag*' | sed -e 's/.*tez-dag-\(.*\).jar.*/\1/'`
+echo "$CURRENT_TEZ"
+
+HIVE_VER=`hive --version | head -1 | grep -Po "(?<=\ ).*?(?=\-)"`
+echo "$HIVE_VER"
+
+sudo yum update -y -q
+sudo yum -y -q install xmlstarlet
+
+#######################
+#backup conf files
+sudo mkdir /mnt/temp0
+sudo cp -t /mnt/temp0 /etc/hadoop/conf.empty/hadoop-env.sh /etc/hadoop/conf.empty/yarn-site.xml /etc/hadoop/conf.empty/mapred-site.xml /etc/hadoop/conf.empty/core-site.xml /etc/tez/conf/tez-site.xml /etc/hive/conf.dist/hive-site.xml ~/.bashrc
+#######################
+function version { echo "$@" | awk -F. '{ printf("%d%03d%03d%03d\n", $1,$2,$3,$4); }'; }
+if [ $(version $TEZ_VERSION) -gt $(version $CURRENT_TEZ) ]
+then 
+sudo hadoop fs -rm -r /apps/tez/*
+sudo wget -q https://www.apache.org/dist/tez/$TEZ_VERSION/apache-tez-$TEZ_VERSION-bin.tar.gz -P /mnt/temp0/tez-$TEZ_VERSION
+sudo tar -xzf /mnt/temp0/tez-$TEZ_VERSION/apache-tez-$TEZ_VERSION-bin.tar.gz -C /mnt/temp0/tez-$TEZ_VERSION
+sudo find /usr/lib/tez/ -type f -name *$CURRENT_TEZ* -delete
+sudo cp /mnt/temp0/tez-$TEZ_VERSION/apache-tez-$TEZ_VERSION-bin/*$TEZ_VERSION* /usr/lib/tez
+cd /mnt/temp0/tez-$TEZ_VERSION/
+sudo tar -czf tez.tar.gz -C /usr/lib/tez/ .
+sudo hadoop fs -copyFromLocal /mnt/temp0/tez-$TEZ_VERSION/tez.tar.gz /apps/tez/
+sudo rm -rf /mnt/var/lib/tomcat8/webapps/tez-ui
+sudo mkdir -p /mnt/var/lib/tomcat8/webapps/tez-ui
+sudo unzip -qq -d /mnt/var/lib/tomcat8/webapps/tez-ui /mnt/temp0/tez-$TEZ_VERSION/apache-tez-$TEZ_VERSION-bin/tez-ui-$TEZ_VERSION.war
+fi
+cd
+
+# remove properties:
+sudo xmlstarlet ed -L -d "//property[*[contains(text(),'tez.runtime.intermediate-input.compress.codec')]]" /etc/tez/conf/tez-site.xml
+sudo xmlstarlet ed -L -d "//property[*[contains(text(),'tez.runtime.intermediate-output.compress.codec')]]" /etc/tez/conf/tez-site.xml
+sudo xmlstarlet ed -L -d "//property[*[contains(text(),'tez.runtime.intermediate-output.should-compress')]]" /etc/tez/conf/tez-site.xml
+sudo xmlstarlet ed -L -d "//property[*[contains(text(),'tez.runtime.intermediate-input.is-compressed')]]" /etc/tez/conf/tez-site.xml
+sudo sed -i '0,/<\/configuration>/s/<\/configuration>/ \
+<property><name>tez.runtime.compress<\/name><value>true<\/value><\/property> \
+<property><name>tez.runtime.compress.codec<\/name><value>org.apache.hadoop.io.compress.Lz4Codec<\/value><\/property>\n&/' /etc/tez/conf/tez-site.xml
+
+
+sudo cp -r /usr/lib/hbase/* /usr/lib/hive/lib
+source ~hadoop/.bashrc
+cd
+sudo wget -q --no-check-certificate --no-proxy 'http://aws-bigdata-blog.s3.amazonaws.com/artifacts/Turbocharge_Apache_Hive_on_EMR/slider/slider-0.92.0-incubating-all.tar.gz' -P /home/hadoop/slider/
+sudo tar -xzf /home/hadoop/slider/slider-0.92.0-incubating-all.tar.gz -C /home/hadoop/slider/
+sudo rm /home/hadoop/slider/slider-0.92.0-incubating-all.tar.gz
+export SLIDER_HOME="/home/hadoop/slider/slider-0.92.0-incubating"
+setup_env=$(cat <<EOF3
+
+fi\nexport SLIDER_HOME="/home/hadoop/slider/slider-0.92.0-incubating" 
+
+PATH=$PATH:$SLIDER_HOME/bin 
+
+export PATH
+EOF3
+)
+sed -i 's@fi@@' /home/hadoop/.bash_profile
+echo -e $setup_env | tee -a /home/hadoop/.bash_profile
+source ~/.bash_profile
+sudo chmod a+x /home/hadoop/slider/slider-0.92.0-incubating/bin/slider
+configure_slider=$(cat <<EOF4
+
+<property>
+    <name>hadoop.registry.zk.quorum</name>
+    <value>$(hostname -f):2181</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.address</name>
+    <value>$(hostname -f):8032</value>
+  </property>
+  <property>
+    <name>yarn.resourcemanager.scheduler.address</name>
+    <value>$(hostname -f):8030</value>
+  </property>
+  <property>
+    <name>fs.defaultFS</name>
+    <value>$(hostname -f):8020</value>
+  </property>
+</configuration>
+
+EOF4
+)
+sudo sed -i 's@</configuration>@@' /home/hadoop/slider/slider-0.92.0-incubating/conf/slider-client.xml; echo $configure_slider | sudo tee -a /home/hadoop/slider/slider-0.92.0-incubating/conf/slider-client.xml
+configure_hive=$(cat <<EOF2
+<property>
+  <name>hive.zookeeper.quorum</name>
+  <value>$(hostname -f):2181</value>
+</property>
+<property>
+  <name>hive.execution.mode</name>
+  <value>llap</value>
+</property>
+<property>
+  <name>hive.llap.execution.mode</name>
+  <value>all</value>
+</property>
+<property>
+  <name>hive.llap.daemon.service.hosts</name>
+  <value>@llap_demo</value>
+</property>
+<property>
+  <name>tez.runtime.io.sort.mb</name>
+  <value>150</value>
+</property>
+</configuration>
+EOF2
+)
+sudo sed -i 's@</configuration>@@' /etc/hive/conf/hive-site.xml; echo $configure_hive | sudo tee -a /etc/hive/conf/hive-site.xml
+
+sudo aws s3 sync --quiet s3://path-to-your-s3/lib-$HIVE_VER/ /mnt/temp0/lib/
+
+CORE_TYPE=$(cat /mnt/var/lib/info/job-flow.json | sed -n -e '/Core/,$p' | grep instanceType | head -n 1 | cut -f2 -d: | cut -f2 -d'"')
+LLAP_INSTANCES=`cat /mnt/var/lib/info/job-flow.json | grep instanceCount | ruby -e "puts STDIN.gets.split.last.split(',').first.to_i-1"`
+if [ $LLAP_INSTANCES == 0 ]; then LLAP_INSTANCES=1; fi
+LLAP_IOTHREADS=$(curl -s 'https://www.ec2instances.info' | sed -n -e "/$CORE_TYPE/,\$p" | grep vCPUs | head -n 1 | grep -o -E '[0-9]+')
+LLAP_EXECUTORS=$LLAP_IOTHREADS
+LLAP_LOGLEVEL=INFO
+#LLAP_LOGLEVEL=WARN
+
+########################
+# Set LLAP container size (default 0.5, 50% of availabel memory per core)
+# Working memory (Xmx) + cache size have to be smaller than the container sizing
+LLAP_PERC=0.96
+########################
+
+CORE_MEM=$(curl -s 'https://www.ec2instances.info' | sed -n -e "/$CORE_TYPE/,\$p" | grep GiB | head -n 1 | grep -o -E '[0-9]+' | head -n 1)
+LLAP_SIZE=$(printf "%.0f" $(expr $CORE_MEM*$LLAP_PERC*1000 | bc))
+LLAP_XMX=$(printf "%.0f" $(expr $LLAP_SIZE*0.5 | bc))
+LLAP_CACHE=$(printf "%.0f" $(expr $LLAP_SIZE*0.4 | bc))
+echo "$CORE_MEM"
+echo "$LLAP_SIZE"
+
+hive --service llap --name llap_demo --instances $LLAP_INSTANCES --cache ${LLAP_CACHE}m --executors $LLAP_EXECUTORS --iothreads $LLAP_IOTHREADS --size ${LLAP_SIZE}m --xmx ${LLAP_XMX}m --loglevel $LLAP_LOGLEVEL --args "-XX:+UseG1GC -XX:+ResizeTLAB -XX:+UseNUMA  -XX:-ResizePLAB -XX:MaxGCPauseMillis=200" --javaHome $JAVA_HOME
+
+dt=$(date); arr=($dt); if [ ${arr[2]} -gt 0 ] && [ ${arr[2]} -lt 10 ]; then date_string=0${arr[2]}${arr[1]}${arr[5]}; else date_string=${arr[2]}${arr[1]}${arr[5]}; fi
+cd llap-slider-$date_string; unzip -qq llap-$date_string.zip -d unzipped; cd unzipped/package/files; tar -xzf llap-$date_string.tar.gz
+
+sudo rm -rf lib/
+sudo cp -r /mnt/temp0/lib/ lib/
+
+if [ $(version $TEZ_VERSION) -gt $(version $CURRENT_TEZ) ]
+then 
+sudo find /home/hadoop/llap-slider-$date_string/unzipped/package/files/lib/ -type f -name *$CURRENT_TEZ* -delete
+sudo cp /mnt/temp0/tez-$TEZ_VERSION/apache-tez-$TEZ_VERSION-bin/*$TEZ_VERSION* /home/hadoop/llap-slider-$date_string/unzipped/package/files/lib/tez
+fi
+sudo rm -rf llap-$date_string.tar.gz; sudo tar -czf llap-$date_string.tar.gz *; sudo rm -rf bin  conf  config.json  lib; cd /home/hadoop/llap-slider-$date_string/; sudo rm -rf llap-$date_string.zip; cd unzipped; sudo zip -rq llap-$date_string.zip *; sudo cp llap-$date_string.zip ../; cd ..; sudo rm -rf unzipped/
+sudo sed -i /home/hadoop/llap-slider-$date_string/appConfig.json -e '14s!None!/usr/lib/hadoop-lzo/lib/*!'
+
+/home/hadoop/llap-slider-$date_string/run.sh
+cd
